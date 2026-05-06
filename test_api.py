@@ -121,6 +121,40 @@ def test_invalid_record():
     print("  ✓ OK (422 attendu)")
 
 
+def test_simulate():
+    print_separator("POST /api/v1/simulate  (5 enregistrements, transform=true)")
+    r = requests.post(
+        f"{BASE_URL}/api/v1/simulate",
+        json={"count": 5, "seed": 42, "transform": True, "store": False},
+    )
+    data = r.json()
+    print(f"  Total générés   : {data['total']}")
+    print(f"  Graine          : {data['seed']}")
+    print(f"  Transformé      : {data['transformed']}")
+    first = data["records"][0]
+    print(f"  [0] Compte      : {first['parsed'].get('ACCNO', '?')}")
+    print(f"  [0] Couverture  : {first['coverage_pct']} %")
+    print(f"  [0] raw_record  : {first['raw_record'][:30]}...")
+    assert r.status_code == 200 and data["total"] == 5, "ÉCHEC /simulate"
+    assert all(rec["raw_record"] for rec in data["records"]), "Enregistrements vides"
+    print("  ✓ OK")
+
+
+def test_simulate_raw():
+    print_separator("POST /api/v1/simulate  (3 enregistrements bruts, sans transformation)")
+    r = requests.post(
+        f"{BASE_URL}/api/v1/simulate",
+        json={"count": 3, "transform": False},
+    )
+    data = r.json()
+    print(f"  Total générés   : {data['total']}")
+    print(f"  Transformé      : {data['transformed']}")
+    assert r.status_code == 200 and data["total"] == 3, "ÉCHEC /simulate (raw)"
+    assert not data["transformed"], "transform devrait être false"
+    assert data["records"][0]["document"] is None, "document devrait être null"
+    print("  ✓ OK")
+
+
 def test_get_mappings():
     print_separator("GET /api/v1/mappings")
     r = requests.get(f"{BASE_URL}/api/v1/mappings")
@@ -196,6 +230,8 @@ if __name__ == "__main__":
         test_get_mappings()
         test_upload_mappings(args.xlsx)
         test_invalid_file_upload()
+        test_simulate_raw()
+        test_simulate()
         test_transform_single()
         test_transform_batch()
         test_stats()

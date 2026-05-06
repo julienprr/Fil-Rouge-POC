@@ -93,6 +93,67 @@ docker-compose down -v
 | `GET` | `/api/v1/stats` | Monitoring | Statistiques de couverture session |
 | `POST` | `/api/v1/mappings/upload` | Mappings | Upload d'un .xlsx SSSOM → conversion + rechargement à chaud |
 | `GET` | `/api/v1/mappings` | Mappings | Informations sur les mappings actifs |
+| `POST` | `/api/v1/simulate` | Simulation | Génère des enregistrements Mainframe synthétiques (Copybook) |
+
+---
+
+### `POST /api/v1/simulate`
+
+Génère des enregistrements Mainframe synthétiques au format COBOL Copybook. Reproduit la logique du notebook poc_v2.py (cellule 2.3) : données personnelles via Faker fr_FR, valeurs codées pondérées (catégorie client, situation professionnelle, statut compte…), montants en centimes.
+
+**Corps de la requête :**
+
+```json
+{
+  "count": 5,
+  "seed": 42,
+  "transform": true,
+  "store": false
+}
+```
+
+- `count` : nombre d'enregistrements à générer (1–50, défaut 1).
+- `seed` : graine aléatoire pour des résultats reproductibles (optionnel).
+- `transform` : si `true`, chaque enregistrement est aussi transformé en JSON-LD FIBO.
+- `store` : si `true` et `transform=true`, le JSON-LD est sauvegardé dans MinIO.
+
+**Réponse :**
+
+```json
+{
+  "total": 5,
+  "seed": 42,
+  "transformed": true,
+  "records": [
+    {
+      "index": 0,
+      "raw_record": "3821049571...",
+      "parsed": { "ACCNO": "3821049571", "BALANCE": "0000456789", "..." },
+      "document": { "@context": { "..." }, "mappedData": { "..." }, "..." },
+      "coverage_pct": 85.0,
+      "mapped_fields": 17,
+      "unmapped_fields": 3,
+      "storage": null
+    }
+  ]
+}
+```
+
+**Exemple curl :**
+
+```bash
+# Générer 3 enregistrements bruts (sans transformation)
+curl -X POST http://localhost:8000/api/v1/simulate \
+  -H "Content-Type: application/json" \
+  -d '{"count": 3, "transform": false}'
+
+# Générer 1 enregistrement et le transformer en JSON-LD
+curl -X POST http://localhost:8000/api/v1/simulate \
+  -H "Content-Type: application/json" \
+  -d '{"count": 1, "seed": 42, "transform": true, "store": true}'
+```
+
+Cet endpoint est particulièrement utile pour tester le pipeline complet sans avoir besoin d'un fichier `.dat` Mainframe réel.
 
 ---
 
@@ -270,6 +331,13 @@ POC_v3/
 │   │   │                       → transform_record(...) : dict → document JSON-LD
 │   │   │                       → build_jsonld_context(curie_map) : dict @context
 │   │   │                       → map_field_value(...) : recherche SSSOM en 2 niveaux
+│   │   │
+│   │   ├── simulator.py        Générateur de données Mainframe synthétiques
+│   │   │                       → generate_record(seed) : génère 1 enregistrement (dict)
+│   │   │                       → generate_batch(count, seed) : lot d'enregistrements
+│   │   │                       → to_copybook(record) : dict → chaîne Copybook 132 car.
+│   │   │                       Utilise Faker fr_FR pour les données personnelles,
+│   │   │                       avec pools pondérés pour les codes métier.
 │   │   │
 │   │   └── storage.py          Client de stockage unifié (MinIO + repli local)
 │   │                           → StorageClient.save(account_id, document)
