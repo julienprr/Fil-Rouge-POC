@@ -26,6 +26,7 @@ from core.sssom import load_sssom, build_lookup
 from core.transform import transform_record, build_jsonld_context
 from core.storage import StorageClient
 from core.converter import convert_xlsx_to_sssom, ConversionError
+from core.simulator import generate_batch, to_copybook
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -153,6 +154,34 @@ class MappingsInfoResponse(BaseModel):
     curie_prefixes: list[str]
     sssom_file: str
     last_uploaded_by: str
+
+
+class SimulateRequest(BaseModel):
+    count: Annotated[
+        int,
+        Field(default=1, ge=1, le=50, description="Nombre d'enregistrements à générer (1–50).")
+    ] = 1
+    seed: int | None = Field(default=None, description="Graine aléatoire pour des résultats reproductibles.")
+    transform: bool = Field(default=False, description="Si true, chaque enregistrement est également transformé en JSON-LD.")
+    store: bool = Field(default=False, description="Si true et transform=true, le document JSON-LD est sauvegardé dans MinIO.")
+
+
+class SimulateRecordItem(BaseModel):
+    index: int
+    raw_record: str
+    parsed: dict
+    document: dict | None = None
+    coverage_pct: float | None = None
+    mapped_fields: int | None = None
+    unmapped_fields: int | None = None
+    storage: dict | None = None
+
+
+class SimulateResponse(BaseModel):
+    total: int
+    seed: int | None
+    transformed: bool
+    records: list[SimulateRecordItem]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -401,4 +430,78 @@ def get_mappings_info():
         curie_prefixes=list(state["curie_map"].keys()),
         sssom_file=SSSOM_PATH,
         last_uploaded_by=meta.get("uploaded_file", "fichier initial (démarrage)"),
+    )
+
+
+@app.post("/api/v1/simulate", response_model=SimulateResponse, tags=["Simulation"])
+def simulate(req: SimulateRequest):
+    """
+    Génère des enregistrements Mainframe synthétiques au format COBOL Copybook.
+
+    Reproduit la logique de génération du notebook poc_v2.py (cellule 2.3) :
+    données personnelles via Faker fr_FR, valeurs codées pondérées (CATG_CLT,
+    SIT_PRO, STAT_CPTE, etc.), montants en centimes.
+
+    - `count` : nombre d'enregistrements (1–50).
+    - `seed`  : graine reproductible (optionnelle).
+    - `transform` : si true, chaque enregistrement est transformé en JSON-LD FIBO.
+    - `store` : si true et transform=true, le JSON-LD est sauvegardé dans MinIO.
+    """
+    raw_dicts = generate_batch(count=req.count, seed=req.seed)
+
+    items: list[SimulateRecordItem] = []
+
+    for i, rec_dict in enumerate(raw_dicts):
+        raw_line = to_copybook(rec_dict)
+
+        # Parsing Copybook pour exposer les champs structurés
+        try:
+            parsed = parse_copybook_record(raw_line)
+        except ValueError:
+            # Ne devrait pas arriver car le simulateur génère des données valides
+            parsed = rec_dict
+
+        item_kwargs: dict = {
+            "index":      i,
+            "raw_record": raw_line,
+            "parsed":     parsed,
+        }
+
+        if req.transform:
+            doc = transform_record(
+                parsed,
+                state["mapping_lookup"],
+                state["curie_map"],
+                state["mapping_set_id"],
+            )
+            lineage    = doc["_dataLineage"]
+            account_id = parsed.get("ACCNO", f"sim_{i}")
+
+            # Mise à jour des stats de session
+            stats = state["session_stats"]
+            stats["processed"]      += 1
+            stats["total_mapped"]   += lineage["mappedFields"]
+            stats["total_unmapped"] += lineage["unmappedFields"]
+            for f in lineage["fieldDetails"]:
+                stats["confidence_scores"].append(f["confidence"])
+
+            storage_info = None
+            if req.store:
+                storage_info = state["storage"].save(account_id, doc)
+
+            item_kwargs.update({
+                "document":       doc,
+                "coverage_pct":   lineage["coveragePct"],
+                "mapped_fields":  lineage["mappedFields"],
+                "unmapped_fields": lineage["unmappedFields"],
+                "storage":        storage_info,
+            })
+
+        items.append(SimulateRecordItem(**item_kwargs))
+
+    return SimulateResponse(
+        total=req.count,
+        seed=req.seed,
+        transformed=req.transform,
+        records=items,
     )
