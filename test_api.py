@@ -140,6 +140,57 @@ def test_simulate():
     print("  ✓ OK")
 
 
+def test_pipeline():
+    print_separator("POST /api/v1/pipeline  (transform + score en un appel)")
+    record = make_record()
+    r = requests.post(
+        f"{BASE_URL}/api/v1/pipeline",
+        json={"raw_record": record, "store": False, "include_document": False},
+    )
+    data = r.json()
+    print(f"  Compte          : {data['account_id']}")
+    print(f"  Couverture FIBO : {data['coverage_pct']} %")
+    print(f"  Score           : {data['score']} / 100")
+    print(f"  Décision        : {data['decision']}")
+    print(f"  Règles actives  : {len(data['factors'])}")
+    print(f"  Règles bloquées : {len(data['unmapped_rules'])} (mapping SSSOM manquant)")
+    for f in data["factors"]:
+        print(f"    [{f['points']:+6.1f} pts]  {f['detail']}")
+    assert r.status_code == 200, "ÉCHEC /pipeline"
+    assert data["decision"] in ("ACCORD", "ALERTE", "REFUS"), "Décision invalide"
+    assert 0 <= data["score"] <= 100, "Score hors plage"
+    print("  ✓ OK")
+
+
+def test_score():
+    print_separator("POST /api/v1/score  (scoring depuis JSON-LD)")
+    # 1. Récupérer un document JSON-LD via /transform
+    record = make_record()
+    r_transform = requests.post(
+        f"{BASE_URL}/api/v1/transform",
+        json={"raw_record": record, "store": False},
+    )
+    assert r_transform.status_code == 200, "ÉCHEC pré-requis /transform"
+    jsonld_doc = r_transform.json()["document"]
+
+    # 2. Scorer le document JSON-LD directement
+    r = requests.post(f"{BASE_URL}/api/v1/score", json={"document": jsonld_doc})
+    data = r.json()
+    print(f"  Compte          : {data['account_id']}")
+    print(f"  Score           : {data['score']} / 100")
+    print(f"  Décision        : {data['decision']}")
+    print(f"  Couverture FIBO : {data['coverage_pct']} %")
+    print(f"  Règles actives  : {len(data['factors'])}")
+    print(f"  Règles bloquées : {len(data['unmapped_rules'])} (mapping SSSOM manquant)")
+    if data["unmapped_rules"]:
+        for f in data["unmapped_rules"]:
+            print(f"    -> {f['detail'][:80]}")
+    assert r.status_code == 200, "ÉCHEC /score"
+    assert data["decision"] in ("ACCORD", "ALERTE", "REFUS"), "Décision invalide"
+    assert 0 <= data["score"] <= 100, "Score hors plage"
+    print("  ✓ OK")
+
+
 def test_simulate_raw():
     print_separator("POST /api/v1/simulate  (3 enregistrements bruts, sans transformation)")
     r = requests.post(
@@ -230,6 +281,8 @@ if __name__ == "__main__":
         test_get_mappings()
         test_upload_mappings(args.xlsx)
         test_invalid_file_upload()
+        test_pipeline()
+        test_score()
         test_simulate_raw()
         test_simulate()
         test_transform_single()

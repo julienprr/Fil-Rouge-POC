@@ -27,6 +27,7 @@ from core.transform import transform_record, build_jsonld_context
 from core.storage import StorageClient
 from core.converter import convert_xlsx_to_sssom, ConversionError
 from core.simulator import generate_batch, to_copybook
+from core.scorer import score_from_jsonld
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -154,6 +155,63 @@ class MappingsInfoResponse(BaseModel):
     curie_prefixes: list[str]
     sssom_file: str
     last_uploaded_by: str
+
+
+class ScoreRequest(BaseModel):
+    document: dict = Field(
+        description=(
+            "Document JSON-LD FIBO — sortie de POST /api/v1/transform. "
+            "Le scorer lit exclusivement depuis mappedData ; les champs "
+            "absents du mapping SSSOM bloquent les règles correspondantes."
+        )
+    )
+
+
+class ScoreFactor(BaseModel):
+    rule:    str
+    points:  float
+    detail:  str
+
+
+class ScoreResponse(BaseModel):
+    account_id:      str
+    score:           float
+    decision:        str   # "ACCORD" | "ALERTE" | "REFUS"
+    factors:         list[ScoreFactor]
+    unmapped_rules:  list[ScoreFactor]
+    raw_points:      float
+    thresholds:      dict
+    coverage_pct:    float
+
+
+class PipelineRequest(BaseModel):
+    raw_record: Annotated[
+        str,
+        Field(
+            description=f"Enregistrement Mainframe brut — chaîne de {TOTAL_RECORD_LENGTH} caractères.",
+            min_length=TOTAL_RECORD_LENGTH,
+        )
+    ]
+    store: bool = Field(default=False, description="Sauvegarder le JSON-LD dans MinIO.")
+    include_document: bool = Field(default=False, description="Inclure le document JSON-LD dans la réponse.")
+
+
+class PipelineResponse(BaseModel):
+    account_id:      str
+    # — résultat de la transformation
+    coverage_pct:    float
+    mapped_fields:   int
+    unmapped_fields: int
+    storage:         dict | None
+    # — résultat du scoring
+    score:           float
+    decision:        str
+    factors:         list[ScoreFactor]
+    unmapped_rules:  list[ScoreFactor]
+    raw_points:      float
+    thresholds:      dict
+    # — document JSON-LD (optionnel)
+    document:        dict | None = None
 
 
 class SimulateRequest(BaseModel):
@@ -430,6 +488,98 @@ def get_mappings_info():
         curie_prefixes=list(state["curie_map"].keys()),
         sssom_file=SSSOM_PATH,
         last_uploaded_by=meta.get("uploaded_file", "fichier initial (démarrage)"),
+    )
+
+
+@app.post("/api/v1/score", response_model=ScoreResponse, tags=["Scoring"])
+def score_single(req: ScoreRequest):
+    """
+    Calcule un score crédit à partir d'un document JSON-LD FIBO.
+
+    Entrée : la sortie de POST /api/v1/transform (champ `document`).
+    Le scorer lit exclusivement depuis `mappedData` — il est agnostique
+    à la source des données. Tout système produisant du JSON-LD FIBO
+    (Mainframe, open banking, bureau de crédit) peut alimenter cet endpoint.
+
+    Les champs absents du mapping SSSOM (`unmappedData`) bloquent les
+    règles correspondantes, signalées dans `unmapped_rules`.
+    """
+    doc     = req.document
+    lineage = doc.get("_dataLineage", {})
+
+    result = score_from_jsonld(doc)
+
+    return ScoreResponse(
+        account_id=result["account_id"],
+        score=result["score"],
+        decision=result["decision"],
+        factors=[ScoreFactor(**f) for f in result["factors"]],
+        unmapped_rules=[ScoreFactor(**f) for f in result["unmapped_rules"]],
+        raw_points=result["raw_points"],
+        thresholds=result["thresholds"],
+        coverage_pct=lineage.get("coveragePct", 0.0),
+    )
+
+
+@app.post("/api/v1/pipeline", response_model=PipelineResponse, tags=["Scoring"])
+def pipeline(req: PipelineRequest):
+    """
+    Raccourci enchaînant transformation sémantique + scoring en un seul appel.
+
+    Flux interne :
+      1. Parsing Copybook → dict structuré
+      2. Transformation → document JSON-LD FIBO (+ stockage MinIO optionnel)
+      3. Scoring à règles métier sur le JSON-LD
+
+    Équivalent à appeler POST /api/v1/transform puis POST /api/v1/score.
+    Utile pour les tests et les démos ; en production, préférer les deux
+    endpoints séparés pour découpler les responsabilités.
+    """
+    # 1. Parsing
+    try:
+        record = parse_copybook_record(req.raw_record)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # 2. Transformation sémantique
+    doc     = transform_record(
+        record,
+        state["mapping_lookup"],
+        state["curie_map"],
+        state["mapping_set_id"],
+    )
+    lineage    = doc["_dataLineage"]
+    account_id = record.get("ACCNO", "unknown")
+
+    # Stats de session
+    stats = state["session_stats"]
+    stats["processed"]      += 1
+    stats["total_mapped"]   += lineage["mappedFields"]
+    stats["total_unmapped"] += lineage["unmappedFields"]
+    for f in lineage["fieldDetails"]:
+        stats["confidence_scores"].append(f["confidence"])
+
+    # Stockage
+    storage_info = None
+    if req.store:
+        storage_info = state["storage"].save(account_id, doc)
+
+    # 3. Scoring sur le JSON-LD
+    result = score_from_jsonld(doc)
+
+    return PipelineResponse(
+        account_id=account_id,
+        coverage_pct=lineage["coveragePct"],
+        mapped_fields=lineage["mappedFields"],
+        unmapped_fields=lineage["unmappedFields"],
+        storage=storage_info,
+        score=result["score"],
+        decision=result["decision"],
+        factors=[ScoreFactor(**f) for f in result["factors"]],
+        unmapped_rules=[ScoreFactor(**f) for f in result["unmapped_rules"]],
+        raw_points=result["raw_points"],
+        thresholds=result["thresholds"],
+        document=doc if req.include_document else None,
     )
 
 

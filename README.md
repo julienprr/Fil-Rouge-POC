@@ -94,6 +94,97 @@ docker-compose down -v
 | `POST` | `/api/v1/mappings/upload` | Mappings | Upload d'un .xlsx SSSOM → conversion + rechargement à chaud |
 | `GET` | `/api/v1/mappings` | Mappings | Informations sur les mappings actifs |
 | `POST` | `/api/v1/simulate` | Simulation | Génère des enregistrements Mainframe synthétiques (Copybook) |
+| `POST` | `/api/v1/score` | Scoring | Calcule un score crédit depuis un document JSON-LD FIBO |
+| `POST` | `/api/v1/pipeline` | Scoring | Raccourci : transform + score en un seul appel |
+
+---
+
+### `POST /api/v1/score`
+
+Calcule un score crédit sur un enregistrement Mainframe brut. Le scoring est basé sur des règles métier inspirées de Bâle II/III — aucun entraînement de modèle ML n'est requis, ce qui est cohérent avec des données synthétiques.
+
+Le pipeline interne est : parsing Copybook → application des règles → normalisation [0–100] → décision.
+
+**Règles appliquées :**
+
+| Règle | Champ source | Concept FIBO | Impact max |
+|---|---|---|---|
+| Score interne normalisé | `SCORE_INT` | `fibo-loan:CreditScore` | 0 → +50 pts |
+| Ratio dette/revenu (DTI) | `CHARGES_MENS / REVENU_MENS` | `fibo-loan:DebtToIncomeRatio` | -30 → +20 pts |
+| Incidents de paiement | `INC_PAY` | `fibo-loan:DelinquencyStatus` | -30 → +15 pts |
+| Historique 12 mois | `NB_INC_12M` | `fibo-loan:DelinquencyHistory` | -20 → 0 pts |
+| Statut du compte | `STAT_CPTE` | `fibo-fbc:AccountStatus` | -40 → +5 pts |
+| Découvert | `FLAG_DECVRT` | `fibo-fbc:Overdraft` | -10 → 0 pts |
+| Ancienneté | `ANCIENNETE` | `fibo-fbc:AccountOpeningDate` | -5 → +10 pts |
+
+**Seuils de décision :** ACCORD >= 65 / ALERTE 45–64 / REFUS < 45
+
+Le scorer est **agnostique à la source** : il consomme du JSON-LD FIBO, quelle que soit son origine (Mainframe, open banking, bureau de crédit). C'est la démonstration centrale de l'interopérabilité sémantique.
+
+**Corps de la requête :**
+
+```json
+{
+  "document": { "@context": {...}, "mappedData": {...}, "_dataLineage": {...} }
+}
+```
+
+- `document` : sortie du champ `document` retourné par `POST /api/v1/transform`.
+
+**Réponse :**
+
+```json
+{
+  "account_id": "9876543210",
+  "score": 72.4,
+  "decision": "ACCORD",
+  "raw_points": 45.0,
+  "thresholds": { "accord": 65, "alerte": 45 },
+  "coverage_pct": 85.0,
+  "factors": [
+    { "rule": "score_interne",        "points": 28.5, "detail": "SCORE_INT=614 → 28.5/50 pts de base" },
+    { "rule": "dti",                  "points": 10,   "detail": "DTI 30–40 % (DTI=35.2%) → +10 pts" },
+    { "rule": "incidents_paiement",   "points": 15,   "detail": "INC_PAY=00 (aucun incident) → +15 pts" },
+    { "rule": "nb_incidents_12m",     "points":  0,   "detail": "NB_INC_12M=0 → +0 pts" },
+    { "rule": "statut_compte",        "points":  5,   "detail": "STAT_CPTE=01 (actif) → +5 pts" },
+    { "rule": "decouvert",            "points":  0,   "detail": "FLAG_DECVRT=0 → +0 pts" },
+    { "rule": "anciennete",           "points": -14,  "detail": "ANCIENNETE=8 mois (< 12 mois) → -5 pts" }
+  ],
+  "document": { "..." }
+}
+```
+
+**Exemple curl (en deux étapes) :**
+
+```bash
+# Étape 1 — transformer un enregistrement Mainframe
+DOC=$(curl -s -X POST http://localhost:8000/api/v1/transform \
+  -H "Content-Type: application/json" \
+  -d '{"raw_record": "<132 chars>", "store": false}' | jq '.document')
+
+# Étape 2 — scorer le document JSON-LD
+curl -X POST http://localhost:8000/api/v1/score \
+  -H "Content-Type: application/json" \
+  -d "{\"document\": $DOC}"
+```
+
+Pour un appel unique (transform + score), utiliser `POST /api/v1/pipeline`.
+
+---
+
+### `POST /api/v1/pipeline`
+
+Raccourci qui enchaîne `POST /api/v1/transform` puis `POST /api/v1/score` en un seul appel. Utile pour les tests et les démos.
+
+```json
+{
+  "raw_record": "9876543210...",
+  "store": false,
+  "include_document": false
+}
+```
+
+En production, préférer les deux endpoints séparés pour découpler les responsabilités : le pipeline d'intégration (NiFi) appelle `/transform`, le moteur de décision appelle `/score`.
 
 ---
 
@@ -332,6 +423,10 @@ POC_v3/
 │   │   │                       → build_jsonld_context(curie_map) : dict @context
 │   │   │                       → map_field_value(...) : recherche SSSOM en 2 niveaux
 │   │   │
+│   │   ├── scorer.py           Moteur de scoring crédit à règles métier (Bâle II/III)
+│   │   │                       → score_record(record) : dict → score, décision, facteurs
+│   │   │                       Chaque règle est annotée avec le concept FIBO associé.
+│   │   │
 │   │   ├── simulator.py        Générateur de données Mainframe synthétiques
 │   │   │                       → generate_record(seed) : génère 1 enregistrement (dict)
 │   │   │                       → generate_batch(count, seed) : lot d'enregistrements
@@ -453,9 +548,50 @@ Sortie attendue :
 
 ---
 
-## Prochaine étape — Intégration NiFi
+## Limites du POC v3
 
-La v3 expose une API REST que n'importe quel iPaaS peut appeler. La prochaine étape est d'intégrer Apache NiFi comme orchestrateur :
+### Source de données unique
+
+Le scoring crédit implémenté dans ce POC repose exclusivement sur les données du Mainframe (solde, incidents de paiement, ancienneté, ratio dette/revenu, score interne). En situation réelle, un score d'octroi de crédit agrège des données provenant de plusieurs systèmes sources distincts :
+
+| Source | Exemples de données | Mapping nécessaire |
+|---|---|---|
+| Mainframe (zBANK) | Solde, incidents, ancienneté | `mainframe_to_fibo.sssom.tsv` (existant) |
+| CRM | Segment client, multi-détention, réclamations | `crm_to_fibo.sssom.tsv` (à créer) |
+| Bureau de crédit | FICP, score externe, historique dettes | `bureau_to_fibo.sssom.tsv` (à créer) |
+| Demande de crédit | Montant, durée, objet du financement | `demande_to_fibo.sssom.tsv` (à créer) |
+
+C'est précisément là que réside la valeur architecturale de l'approche : chaque système source dispose de son propre fichier de mapping SSSOM vers FIBO. Le service de scoring (`POST /api/v1/score`) consomme un document JSON-LD FIBO unifié, indépendamment de l'origine des données. Un endpoint `/api/v1/enrich` pourrait fusionner les documents JSON-LD issus de plusieurs sources avant de les soumettre au scorer — sans modifier le scorer lui-même.
+
+Cette limite est assumée dans le cadre du POC. Le mécanisme de transformation sémantique est démontré sur une source ; l'extension à d'autres sources est architecturalement triviale et suit le même patron.
+
+### Modèle de scoring simplifié
+
+Les règles métier implémentées sont inspirées de Bâle II/III mais volontairement simplifiées. Un modèle de production ferait appel à des techniques de scoring statistique (régression logistique, gradient boosting) entraînées sur des données historiques labellisées réelles, soumises à validation réglementaire (ACPR).
+
+### Données synthétiques
+
+Les enregistrements générés par `POST /api/v1/simulate` sont produits par des distributions aléatoires pondérées sans corrélation statistique réelle entre les champs. Ils servent uniquement à valider le pipeline technique — ils ne permettent pas d'entraîner un modèle prédictif fiable.
+
+---
+
+## Perspectives — POC v4
+
+La v4 viserait une architecture découplée en composants indépendants communiquant via Apache Kafka, se rapprochant d'un modèle réaliste de SI bancaire :
+
+- **Producteur Mainframe** (conteneur dédié) : génère des enregistrements Copybook et les publie sur un topic Kafka `mainframe.transactions.raw`. Seul composant qui connaît le format COBOL.
+- **Service de transformation sémantique** (FastAPI actuel allégé) : consomme le topic `raw`, applique les mappings SSSOM, publie sur `mainframe.transactions.jsonld`.
+- **Service de scoring** (conteneur séparé) : consomme le topic JSON-LD, produit des décisions crédit sur `credit.decisions`. Ne connaît pas le format COBOL.
+- **Apache NiFi** : orchestrateur des flux, gestion des erreurs, routage selon le taux de couverture SSSOM, écriture dans MinIO.
+- **Mapping CRM** : second simulateur + fichier SSSOM `crm_to_fibo.sssom.tsv`, pour démontrer la fusion multi-sources.
+
+Le contrat entre tous ces composants est l'ontologie FIBO — pas un format propriétaire. C'est la démonstration centrale du projet à l'échelle d'une architecture distribuée.
+
+---
+
+## Prochaine étape v3 — Intégration NiFi
+
+La v3 expose une API REST que n'importe quel iPaaS peut appeler. La prochaine étape immédiate est d'intégrer Apache NiFi comme orchestrateur :
 
 - **GetFile** : lire le fichier .dat Mainframe déposé dans un répertoire surveillé.
 - **SplitText** : découper le fichier en enregistrements individuels (1 ligne = 1 message).
