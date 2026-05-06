@@ -1,0 +1,101 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POC Fil Rouge v3 — Stack locale
+#
+# Services :
+#   api     → FastAPI (transformation sémantique Mainframe → FIBO JSON-LD)
+#   minio   → Stockage objet compatible S3
+#   mc-init → Initialisation automatique du bucket MinIO (one-shot)
+#
+# Démarrage : docker-compose up --build
+# API Docs  : http://localhost:8000/docs
+# MinIO UI  : http://localhost:9001  (minioadmin / minioadmin)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Service de transformation sémantique ──────────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: filrouge-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Fichier SSSOM/TSV (lecture/écriture — mis à jour via POST /api/v1/mappings/upload)
+      - ./data:/app/data
+      # Sorties JSON-LD en cas de repli local
+      - api-output:/app/output
+      # Hot-reload du code en développement
+      - ./api:/app
+    depends_on:
+      minio:
+        condition: service_healthy
+      mc-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - filrouge-net
+
+  # ── Stockage objet MinIO (compatible S3) ──────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: filrouge-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Console web
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - filrouge-net
+
+  # ── Initialisation du bucket MinIO (s'exécute une seule fois) ─────────────
+  mc-init:
+    image: minio/mc:latest
+    container_name: filrouge-mc-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file:
+      - .env
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ACCESS_KEY} $${MINIO_SECRET_KEY} &&
+        mc mb --ignore-existing local/$${MINIO_BUCKET} &&
+        echo 'Bucket $${MINIO_BUCKET} prêt.'
+      "
+    networks:
+      - filrouge-net
+
+# ── Volumes persistants ───────────────────────────────────────────────────────
+volumes:
+  minio-data:
+    driver: local
+  api-output:
+    driver: local
+
+# ── Réseau interne ────────────────────────────────────────────────────────────
+networks:
+  filrouge-net:
+    driver: bridge
